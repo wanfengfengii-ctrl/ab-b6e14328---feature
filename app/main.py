@@ -1,10 +1,14 @@
 """FastAPI 应用：晶圆标记栅格复原服务。"""
 
-from fastapi import FastAPI, HTTPException
+import time
+from typing import Optional
+
+from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
-from .solver import reconstruct
+from .solver import DeadlineExceeded, reconstruct
 
 app = FastAPI(
     title="Wafer Grid Reconstruction API",
@@ -47,6 +51,12 @@ class ReconstructRequest(BaseModel):
     cols: int = Field(..., ge=3, le=7)
     max_outliers: int = Field(..., ge=0, le=2)
     tolerance: int = Field(..., ge=0, description="逐分量（L∞）坐标容差")
+    deadline_ms: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=5000,
+        description="可选裁决时限（毫秒，1–5000）；到期仍无法完成全局最优裁决时返回 504",
+    )
     origin_bounds: VectorBounds
     row_vector_bounds: VectorBounds
     col_vector_bounds: VectorBounds
@@ -77,15 +87,31 @@ async def reconstruct_grid(req: ReconstructRequest):
         "row_vector": _bounds_pair(req.row_vector_bounds),
         "col_vector": _bounds_pair(req.col_vector_bounds),
     }
-    result = await run_in_threadpool(
-        reconstruct,
-        points,
-        req.rows,
-        req.cols,
-        req.tolerance,
-        req.max_outliers,
-        bounds,
-    )
+    deadline = None
+    if req.deadline_ms is not None:
+        deadline = time.monotonic() + req.deadline_ms / 1000.0
+    try:
+        result = await run_in_threadpool(
+            reconstruct,
+            points,
+            req.rows,
+            req.cols,
+            req.tolerance,
+            req.max_outliers,
+            bounds,
+            deadline,
+        )
+    except DeadlineExceeded:
+        # 时限到期且尚未完成裁决：区别于几何无解（200 + solvable=false），
+        # 响应体不得混入任何参数、分配或无解结论，调用方可原样重试。
+        return JSONResponse(
+            status_code=504,
+            content={
+                "status": "deadline_exceeded",
+                "deadline_ms": req.deadline_ms,
+                "retryable": True,
+            },
+        )
     if not result.get("solvable"):
         # 几何上无解不是请求格式错误：以 200 返回明确的无解原因，
         # 由响应体 solvable=false 标识。

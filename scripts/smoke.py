@@ -74,6 +74,32 @@ def expected_payload(points):
     }
 
 
+# 14 个散乱点：容差 3、全宽区间下完整枚举约 2.7s（几何无解），
+# 使 100ms 时限必然在裁决途中到期，而 5000ms 足以完成裁决。
+SLOW_POINTS = [
+    (1, -18, -34), (2, -2, 10), (3, -5, 26), (4, -16, -24),
+    (5, 20, -22), (6, 10, 36), (7, 6, -14), (8, -13, -28),
+    (9, -9, -18), (10, -6, 10), (11, -7, -16), (12, -21, -9),
+    (13, -31, -22), (14, 13, 14),
+]
+
+
+def slow_payload(deadline_ms=None):
+    p = {
+        "points": [{"id": i, "x": x, "y": y} for i, x, y in SLOW_POINTS],
+        "rows": 4,
+        "cols": 4,
+        "max_outliers": 2,
+        "tolerance": 3,
+        "origin_bounds": {"x": {"lo": -3, "hi": 3}, "y": {"lo": -3, "hi": 3}},
+        "row_vector_bounds": {"x": {"lo": -3, "hi": 3}, "y": {"lo": -3, "hi": 3}},
+        "col_vector_bounds": {"x": {"lo": -3, "hi": 3}, "y": {"lo": -3, "hi": 3}},
+    }
+    if deadline_ms is not None:
+        p["deadline_ms"] = deadline_ms
+    return p
+
+
 def check_result(result):
     assert result["solvable"] is True, result.get("reason")
     p = result["parameters"]
@@ -116,25 +142,64 @@ def check_result(result):
     )
 
 
+def http_post_json(base_url, payload, timeout=30):
+    """POST JSON，返回 (status_code, body_dict)，不把 4xx/5xx 当作异常。"""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/api/wafer-grids/reconstruct",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def check_deadline_over_http(base_url):
+    """受限请求及时 504 退出，随后放宽时限的普通请求仍能完成裁决。
+
+    且 504 响应体只表达“本次尚未裁决”，不混入参数、分配或无解结论。
+    """
+    import time
+
+    t0 = time.monotonic()
+    status, body = http_post_json(base_url, slow_payload(deadline_ms=100))
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    assert status == 504, (status, body)
+    assert elapsed_ms < 1500, f"受限请求未及时退出：{elapsed_ms:.0f}ms"
+    assert body == {
+        "status": "deadline_exceeded",
+        "deadline_ms": 100,
+        "retryable": True,
+    }, body
+    assert not (
+        {"parameters", "assignments", "discarded", "solvable", "reason"} & set(body)
+    )
+    print(f"==> 受限请求在 {elapsed_ms:.0f}ms 内以 504 及时退出")
+
+    # 随后放宽时限：同一请求完成裁决，明确给出几何无解结论
+    status2, body2 = http_post_json(base_url, slow_payload(deadline_ms=5000))
+    assert status2 == 200, (status2, body2)
+    assert body2["solvable"] is False and body2["reason"], body2
+    print("==> 放宽时限后的普通请求完成裁决（几何无解，非尚未裁决）")
+
+
 def main():
     points, _ = build_case()
     base_url = os.environ.get("BASE_URL")
     if base_url:
-        import urllib.request
-
-        payload = expected_payload(points)
-        req = urllib.request.Request(
-            base_url.rstrip("/") + "/api/wafer-grids/reconstruct",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read())
+        status, result = http_post_json(base_url, expected_payload(points))
+        assert status == 200, (status, result)
         print(f"==> 通过 HTTP ({base_url}) 冒烟")
+        check_deadline_over_http(base_url)
     else:
         result = reconstruct(points, 4, 4, 1, 2, BOUNDS)
-        print("==> 直测求解器冒烟")
+        print("==> 直测求解器冒烟（时限链路需经 HTTP 由 verify 覆盖）")
     check_result(result)
     print("==> 冒烟通过：漏读 4 格 + 2 划痕亮点均正确处理")
 

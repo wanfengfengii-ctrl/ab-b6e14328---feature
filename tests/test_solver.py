@@ -2,18 +2,28 @@
 
 import os
 import sys
+import time
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.solver import reconstruct  # noqa: E402
+from app.solver import DeadlineExceeded, reconstruct  # noqa: E402
 
 BOUNDS_WIDE = {
     "origin": ([-3, 3], [-3, 3]),
     "row_vector": ([-3, 3], [-3, 3]),
     "col_vector": ([-3, 3], [-3, 3]),
 }
+
+# 14 个远离任何候选栅格的散乱点：容差 3、全宽区间下几何无解，
+# 完整枚举约 2.7s，用于验证时限在裁决途中及时中止。
+SLOW_POINTS = [
+    (1, -18, -34), (2, -2, 10), (3, -5, 26), (4, -16, -24),
+    (5, 20, -22), (6, 10, 36), (7, 6, -14), (8, -13, -28),
+    (9, -9, -18), (10, -6, 10), (11, -7, -16), (12, -21, -9),
+    (13, -31, -22), (14, 13, 14),
+]
 
 
 def grid_points(rows, cols, origin, av, bv):
@@ -170,6 +180,42 @@ def test_residual_componentwise_within_tolerance():
         if a["adopted"]:
             assert abs(a["residual"][0]) <= 1
             assert abs(a["residual"][1]) <= 1
+
+
+def test_deadline_raises_when_adjudication_incomplete():
+    # 100ms 远小于完整枚举所需时间：到期时必须抛出，而非给出中间结论
+    t0 = time.monotonic()
+    with pytest.raises(DeadlineExceeded):
+        reconstruct(
+            SLOW_POINTS, 4, 4, 3, 2, BOUNDS_WIDE, deadline=t0 + 0.1
+        )
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    # 及时退出：不得让宽参数请求无限占住求解；留出少量检查点/调度余量
+    assert elapsed_ms < 800
+
+
+def test_slow_case_without_deadline_is_unsolvable():
+    # 对照组：同一请求放宽时限后得到确定的几何无解结论
+    res = reconstruct(SLOW_POINTS, 4, 4, 3, 2, BOUNDS_WIDE)
+    assert res["solvable"] is False
+    assert "reason" in res
+
+
+def test_generous_deadline_returns_uncompromised_optimum():
+    # 宽松时限内完成时，结果与无时限完全一致（未降级）
+    pts = grid_points(3, 3, (0, 0), (2, 1), (-1, 2))
+    res = reconstruct(
+        pts, 3, 3, 0, 0, BOUNDS_WIDE, deadline=time.monotonic() + 5.0
+    )
+    p = res["parameters"]
+    assert (p["origin"], p["row_vector"], p["col_vector"]) == (
+        [0, 0], [2, 1], [-1, 2]
+    )
+    assert res["objective"] == {
+        "discarded_count": 0,
+        "max_manhattan_residual": 0,
+        "total_manhattan_residual": 0,
+    }
 
 
 if __name__ == "__main__":

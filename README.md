@@ -35,7 +35,8 @@ API_PORT=9000 ./verify
 `verify` 容器执行：
 
 1. `pytest` 代码测试；
-2. 复原冒烟（4×4 栅格漏读 4 格 + 2 个划痕亮点 + 坐标抖动，经 HTTP 提交）；
+2. 复原冒烟（经 HTTP 提交）：4×4 栅格漏读 4 格 + 2 个划痕亮点 + 坐标抖动，
+   以及裁决时限链路——受限请求 504 及时退出、随后放宽时限的普通请求完成裁决；
 
 并以自身退出码汇报（成功 0）。单独启动服务：`API_PORT=9000 docker compose up web`。
 
@@ -52,6 +53,7 @@ API_PORT=9000 ./verify
   "cols": 4,
   "max_outliers": 2,
   "tolerance": 1,
+  "deadline_ms": 1000,
   "origin_bounds":      {"x": {"lo": -3, "hi": 3}, "y": {"lo": -3, "hi": 3}},
   "row_vector_bounds":  {"x": {"lo": -3, "hi": 3}, "y": {"lo": -3, "hi": 3}},
   "col_vector_bounds":  {"x": {"lo": -3, "hi": 3}, "y": {"lo": -3, "hi": 3}}
@@ -59,14 +61,29 @@ API_PORT=9000 ./verify
 ```
 
 约束：7–14 个唯一编号点；行/列 3–7；`max_outliers` 0–2；各区间跨度 ≤ 6。
+可选 `deadline_ms` 取值 1–5000（毫秒）；省略时请求、响应、全局最优裁决及无解
+行为与旧版完全兼容，响应体不新增字段。
 
 成功返回（HTTP 200，`solvable: true`）：`parameters`（原点、两基向量、行列式）、
 `objective`（弃点数 / 最大残差 / 残差和）、`assignments`（逐点格位、预测坐标、
 残差）、`discarded`（弃点证据：最近格位、最近残差、容差内候选、弃点原因）。
+在时限内完成时仍返回未经降级的原最优结果——时限只决定“何时放弃等待”，不会
+返回次优解或部分裁决。
 
 几何上无解时返回 HTTP 200、`solvable: false` 及明确的中文 `reason`
 （建议放宽容差/区间或提高弃点上限）；请求本身不合法（编号重复、点数越界、
-区间跨度超 6 等）返回 HTTP 422 并附字段级错误。
+区间跨度超 6、`deadline_ms` 越界等）返回 HTTP 422 并附字段级错误。
+
+**裁决超时**：给出了 `deadline_ms` 且到期仍无法完成全局最优裁决时，返回
+HTTP 504，响应体只有：
+
+```json
+{"status": "deadline_exceeded", "deadline_ms": 1000, "retryable": true}
+```
+
+不混入任何 `parameters`、`assignments`、`discarded`、`solvable` 或 `reason`，
+据此可明确区分“几何无解”与“本次尚未裁决”。请求是只读枚举、无副作用，可
+原样（通常放宽 `deadline_ms`）重试而不影响后续晶圆的处理。
 
 ## 本地开发
 

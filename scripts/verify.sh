@@ -7,7 +7,7 @@ cd /app
 echo "==> [1/2] 单元测试 (pytest)"
 python -m pytest -q
 
-echo "==> [2/2] 复原冒烟（漏读标记 + 划痕亮点）"
+echo "==> [2/2] 复原冒烟（漏读标记 + 划痕亮点 + 裁决时限链路）"
 python scripts/smoke.py
 
 echo "==> VERIFY OK"

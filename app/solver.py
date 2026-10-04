@@ -14,11 +14,29 @@
 枚举规模有界：六个分量各取自跨度 ≤ 6 的闭区间，至多 ``7**6`` 组参数，
 det 过滤、包围盒与邻域集合预过滤后，仅对候选参数运行二分图匹配
 （最小费用最大流， successive shortest path）。
+
+裁决可通过 ``deadline``（``time.monotonic`` 绝对时刻，秒）设限时：
+未能在到期前完成全局枚举时，求解器在安全检查点抛出 :class:`DeadlineExceeded`，
+不返回任何中间参数、分配或无解结论。
 """
 
+import time
 from collections import deque
 from itertools import product
 from typing import Optional
+
+
+class DeadlineExceeded(Exception):
+    """未能在调用方给定的墙钟时限内完成全局最优裁决。
+
+    求解器仅在枚举/匹配的安全检查点抛出；已得到的中间结果一律不返回，
+    调用方放宽时限后可用同一请求原样重试。
+    """
+
+
+def _raise_if_expired(deadline: Optional[float]) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise DeadlineExceeded
 
 
 # ---------------------------------------------------------------------------
@@ -33,13 +51,14 @@ class _MinCostMaxFlow:
         self.g[u].append([v, cap, cost, len(self.g[v])])
         self.g[v].append([u, 0, -cost, len(self.g[u]) - 1])
 
-    def run(self, s, t, need):
+    def run(self, s, t, need, deadline=None):
         """返回 (实际流量, 最小费用)，最多发送 need 个单位。"""
         n = self.n
         flow = 0
         cost = 0
         inf = 10**18
         while flow < need:
+            _raise_if_expired(deadline)
             dist = [inf] * n
             pv = [-1] * n
             pe = [-1] * n
@@ -78,19 +97,21 @@ class _MinCostMaxFlow:
         return flow, cost
 
 
-def _augment(adj, p, match_cell, seen):
+def _augment(adj, p, match_cell, seen, deadline=None):
     """Kuhn 增广路 DFS。adj[p] 为可用格位序号列表。"""
     for c in adj[p]:
         if seen[c]:
             continue
         seen[c] = True
-        if match_cell[c] < 0 or _augment(adj, match_cell[c], match_cell, seen):
+        if match_cell[c] < 0 or _augment(
+            adj, match_cell[c], match_cell, seen, deadline
+        ):
             match_cell[c] = p
             return True
     return False
 
 
-def _max_match(point_edges, n_points, n_cells, cap=None):
+def _max_match(point_edges, n_points, n_cells, cap=None, deadline=None):
     adj = [
         [c for c, mh in point_edges[p] if cap is None or mh <= cap]
         for p in range(n_points)
@@ -98,13 +119,14 @@ def _max_match(point_edges, n_points, n_cells, cap=None):
     match_cell = [-1] * n_cells
     count = 0
     for p in range(n_points):
+        _raise_if_expired(deadline)
         seen = [False] * n_cells
-        if _augment(adj, p, match_cell, seen):
+        if _augment(adj, p, match_cell, seen, deadline):
             count += 1
     return count
 
 
-def _min_cost_flow(point_edges, n_points, n_cells, need, cap):
+def _min_cost_flow(point_edges, n_points, n_cells, need, cap, deadline=None):
     s = n_points + n_cells
     t = s + 1
     net = _MinCostMaxFlow(t + 1)
@@ -116,17 +138,19 @@ def _min_cost_flow(point_edges, n_points, n_cells, need, cap):
         for c, mh in edges:
             if mh <= cap:
                 net.add_edge(p, n_points + c, 1, mh)
-    return net.run(s, t, need)
+    return net.run(s, t, need, deadline)
 
 
 # ---------------------------------------------------------------------------
 # 主求解流程
 # ---------------------------------------------------------------------------
-def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
+def reconstruct(points, rows, cols, tolerance, max_outliers, bounds, deadline=None):
     """复原栅格。
 
     points: [(id, x, y), ...]（调用方保证 7~14 个、编号唯一）。
     bounds: dict(origin=([lox,hix],[loy,hiy]), row_vector=..., col_vector=...)
+    deadline: 可选的 ``time.monotonic`` 绝对截止时刻（秒）；到期且全局裁决
+        尚未完成时抛出 :class:`DeadlineExceeded`。
     返回 dict；无解时返回 {"solvable": False, "reason": ...}。
     """
     n = len(points)
@@ -157,6 +181,7 @@ def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
         range(bxr[0], bxr[1] + 1),
         range(byr[0], byr[1] + 1),
     ):
+        _raise_if_expired(deadline)
         det = ax * by - ay * bx
         if det <= 0:
             continue
@@ -220,7 +245,7 @@ def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
             edges[p] = pe
 
         # 阶段一：最大化采用数（最小化弃点数）
-        adopted = _max_match(edges, n, rows * cols)
+        adopted = _max_match(edges, n, rows * cols, deadline=deadline)
         k = n - adopted
         if k > max_outliers:
             continue
@@ -230,14 +255,21 @@ def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
         lo, hi = 0, len(mhs) - 1
         while lo < hi:
             mid = (lo + hi) // 2
-            if _max_match(edges, n, rows * cols, cap=mhs[mid]) == adopted:
+            if (
+                _max_match(
+                    edges, n, rows * cols, cap=mhs[mid], deadline=deadline
+                )
+                == adopted
+            ):
                 hi = mid
             else:
                 lo = mid + 1
         big_m = mhs[lo]
 
         # 阶段三：最小化残差总和
-        flow, total_s = _min_cost_flow(edges, n, rows * cols, adopted, big_m)
+        flow, total_s = _min_cost_flow(
+            edges, n, rows * cols, adopted, big_m, deadline=deadline
+        )
         if flow != adopted:  # 理论上不会发生，防御性检查
             continue
         assert flow == adopted
@@ -248,7 +280,7 @@ def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
         # 阶段四：该参数下字典序最小的分配（按编号顺序逐点贪心，
         # 每步用后缀最小费用流验证可行性）
         assignment = _lexicographic_assignment(
-            edges, n, rows * cols, adopted, k, big_m, total_s
+            edges, n, rows * cols, adopted, k, big_m, total_s, deadline
         )
         if assignment is None:
             continue
@@ -295,7 +327,9 @@ def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
     )
 
 
-def _lexicographic_assignment(edges, n, n_cells, adopted, k, big_m, total_s):
+def _lexicographic_assignment(
+    edges, n, n_cells, adopted, k, big_m, total_s, deadline=None
+):
     """逐点（编号顺序）贪心：先试弃点（-1），再按格位序号试分配。
 
     每一步通过后缀最小费用流验证：剩余点能否在未占用格位上补足流量，
@@ -324,10 +358,11 @@ def _lexicographic_assignment(edges, n, n_cells, adopted, k, big_m, total_s):
             for c, mh in edges[p]:
                 if c not in used_cells and mh <= big_m:
                     net.add_edge(pidx[p], ns + c, 1, mh)
-        flow, cost = net.run(s, t, need_flow)
+        flow, cost = net.run(s, t, need_flow, deadline)
         return flow == need_flow and cost == budget
 
     for p in range(n):
+        _raise_if_expired(deadline)
         chosen = None
         # 选项 0：弃点（编码 -1，字典序中最先）
         if len(discarded) < k:
