@@ -4,10 +4,13 @@ set -e
 
 cd /app
 
-echo "==> [1/2] 单元测试 (pytest)"
+echo "==> [1/3] 单元测试 (pytest)"
 python -m pytest -q
 
-echo "==> [2/2] 复原冒烟（漏读标记 + 划痕亮点）"
+echo "==> [2/3] 复原冒烟（漏读标记 + 划痕亮点）"
 python scripts/smoke.py
+
+echo "==> [3/3] 时限冒烟（受限请求 504 及时退出 + 随后普通请求完成）"
+python scripts/deadline_smoke.py
 
 echo "==> VERIFY OK"

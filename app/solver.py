@@ -16,9 +16,14 @@ det 过滤、包围盒与邻域集合预过滤后，仅对候选参数运行二�
 （最小费用最大流， successive shortest path）。
 """
 
+import time
 from collections import deque
 from itertools import product
 from typing import Optional
+
+
+class DeadlineExceeded(Exception):
+    """计算时限到期：全局最优裁决尚未完成，已枚举的部分结果一律作废。"""
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +127,13 @@ def _min_cost_flow(point_edges, n_points, n_cells, need, cap):
 # ---------------------------------------------------------------------------
 # 主求解流程
 # ---------------------------------------------------------------------------
-def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
+def reconstruct(points, rows, cols, tolerance, max_outliers, bounds, deadline=None):
     """复原栅格。
 
     points: [(id, x, y), ...]（调用方保证 7~14 个、编号唯一）。
     bounds: dict(origin=([lox,hix],[loy,hiy]), row_vector=..., col_vector=...)
+    deadline: 可选的 time.monotonic() 时限；到期仍未完成裁决时抛出
+        DeadlineExceeded，绝不返回部分枚举得到的降级结果。
     返回 dict；无解时返回 {"solvable": False, "reason": ...}。
     """
     n = len(points)
@@ -157,6 +164,8 @@ def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
         range(bxr[0], bxr[1] + 1),
         range(byr[0], byr[1] + 1),
     ):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise DeadlineExceeded("计算时限到期，全局最优裁决尚未完成")
         det = ax * by - ay * bx
         if det <= 0:
             continue
@@ -248,7 +257,7 @@ def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
         # 阶段四：该参数下字典序最小的分配（按编号顺序逐点贪心，
         # 每步用后缀最小费用流验证可行性）
         assignment = _lexicographic_assignment(
-            edges, n, rows * cols, adopted, k, big_m, total_s
+            edges, n, rows * cols, adopted, k, big_m, total_s, deadline
         )
         if assignment is None:
             continue
@@ -295,7 +304,7 @@ def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
     )
 
 
-def _lexicographic_assignment(edges, n, n_cells, adopted, k, big_m, total_s):
+def _lexicographic_assignment(edges, n, n_cells, adopted, k, big_m, total_s, deadline=None):
     """逐点（编号顺序）贪心：先试弃点（-1），再按格位序号试分配。
 
     每一步通过后缀最小费用流验证：剩余点能否在未占用格位上补足流量，
@@ -328,6 +337,8 @@ def _lexicographic_assignment(edges, n, n_cells, adopted, k, big_m, total_s):
         return flow == need_flow and cost == budget
 
     for p in range(n):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise DeadlineExceeded("计算时限到期，全局最优裁决尚未完成")
         chosen = None
         # 选项 0：弃点（编码 -1，字典序中最先）
         if len(discarded) < k:

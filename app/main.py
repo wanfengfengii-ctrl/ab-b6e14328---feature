@@ -1,10 +1,14 @@
 """FastAPI 应用：晶圆标记栅格复原服务。"""
 
+import time
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
-from .solver import reconstruct
+from .solver import DeadlineExceeded, reconstruct
 
 app = FastAPI(
     title="Wafer Grid Reconstruction API",
@@ -50,6 +54,12 @@ class ReconstructRequest(BaseModel):
     origin_bounds: VectorBounds
     row_vector_bounds: VectorBounds
     col_vector_bounds: VectorBounds
+    deadline_ms: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=5000,
+        description="单次复原的计算时限（毫秒）；省略时不设限，行为与既有版本一致",
+    )
 
     @model_validator(mode="after")
     def _check_points(self):
@@ -77,15 +87,35 @@ async def reconstruct_grid(req: ReconstructRequest):
         "row_vector": _bounds_pair(req.row_vector_bounds),
         "col_vector": _bounds_pair(req.col_vector_bounds),
     }
-    result = await run_in_threadpool(
-        reconstruct,
-        points,
-        req.rows,
-        req.cols,
-        req.tolerance,
-        req.max_outliers,
-        bounds,
-    )
+    deadline = None
+    if req.deadline_ms is not None:
+        deadline = time.monotonic() + req.deadline_ms / 1000.0
+    try:
+        result = await run_in_threadpool(
+            reconstruct,
+            points,
+            req.rows,
+            req.cols,
+            req.tolerance,
+            req.max_outliers,
+            bounds,
+            deadline,
+        )
+    except DeadlineExceeded:
+        # 时限到期：裁决尚未完成。只报告“本次未裁决”，不得混入任何参数、
+        # 分配或无解结论；调用方可放宽 deadline_ms 后重试。
+        return JSONResponse(
+            status_code=504,
+            content={
+                "status": "deadline_exceeded",
+                "deadline_ms": req.deadline_ms,
+                "retryable": True,
+                "detail": (
+                    f"在 {req.deadline_ms} ms 时限内未能完成全局最优裁决；"
+                    "这不代表几何上无解，可放宽 deadline_ms 后重试。"
+                ),
+            },
+        )
     if not result.get("solvable"):
         # 几何上无解不是请求格式错误：以 200 返回明确的无解原因，
         # 由响应体 solvable=false 标识。

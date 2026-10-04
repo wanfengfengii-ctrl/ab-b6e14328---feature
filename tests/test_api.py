@@ -89,3 +89,66 @@ def test_counts_out_of_range():
     p = payload(exact_points())
     p["rows"] = 8
     assert client.post("/api/wafer-grids/reconstruct", json=p).status_code == 422
+
+
+def test_deadline_ms_range_validated():
+    p = payload(exact_points())
+    p["deadline_ms"] = 0
+    assert client.post("/api/wafer-grids/reconstruct", json=p).status_code == 422
+    p = payload(exact_points())
+    p["deadline_ms"] = 5001
+    assert client.post("/api/wafer-grids/reconstruct", json=p).status_code == 422
+    p = payload(exact_points())
+    p["deadline_ms"] = 5000
+    assert client.post("/api/wafer-grids/reconstruct", json=p).status_code == 200
+
+
+def test_deadline_exceeded_returns_504_without_conclusion():
+    # 1ms 时限：完整枚举（约数百毫秒）不可能完成，须返回 504
+    p = payload(exact_points(), deadline_ms=1)
+    r = client.post("/api/wafer-grids/reconstruct", json=p)
+    assert r.status_code == 504
+    body = r.json()
+    assert body["status"] == "deadline_exceeded"
+    assert body["deadline_ms"] == 1
+    assert body["retryable"] is True
+    # 不得混入参数、分配或无解结论
+    for key in (
+        "solvable",
+        "reason",
+        "parameters",
+        "objective",
+        "assignments",
+        "discarded",
+    ):
+        assert key not in body, f"504 响应不得包含 {key}"
+
+
+def test_normal_request_completes_after_deadline_exceeded():
+    # 受限请求 504 后服务不被占住：随后的普通请求照常完成裁决
+    limited = payload(exact_points(), deadline_ms=1)
+    assert client.post("/api/wafer-grids/reconstruct", json=limited).status_code == 504
+    r = client.post("/api/wafer-grids/reconstruct", json=payload(exact_points()))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["solvable"] is True
+    assert body["parameters"]["origin"] == [0, 0]
+
+
+def test_generous_deadline_matches_unlimited_response():
+    # 时限内完成时响应须与无时限请求完全一致（未经降级）
+    r_limited = client.post(
+        "/api/wafer-grids/reconstruct", json=payload(exact_points(), deadline_ms=5000)
+    )
+    r_plain = client.post("/api/wafer-grids/reconstruct", json=payload(exact_points()))
+    assert r_limited.status_code == r_plain.status_code == 200
+    assert r_limited.json() == r_plain.json()
+
+
+def test_omitted_deadline_keeps_unsolvable_behavior():
+    pts = [(i, 100 + 3 * i, 200 + 3 * i) for i in range(1, 8)]
+    r = client.post("/api/wafer-grids/reconstruct", json=payload(pts, max_outliers=2))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["solvable"] is False
+    assert "status" not in body  # 几何无解与时限未裁决是两种不同响应

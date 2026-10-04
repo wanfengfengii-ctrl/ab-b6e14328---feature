@@ -2,12 +2,13 @@
 
 import os
 import sys
+import time
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.solver import reconstruct  # noqa: E402
+from app.solver import DeadlineExceeded, reconstruct  # noqa: E402
 
 BOUNDS_WIDE = {
     "origin": ([-3, 3], [-3, 3]),
@@ -170,6 +171,38 @@ def test_residual_componentwise_within_tolerance():
         if a["adopted"]:
             assert abs(a["residual"][0]) <= 1
             assert abs(a["residual"][1]) <= 1
+
+
+def test_deadline_already_past_raises_without_partial_result():
+    pts, _ = __import__("scripts.smoke", fromlist=["build_case"]).build_case()
+    t0 = time.monotonic()
+    with pytest.raises(DeadlineExceeded):
+        reconstruct(pts, 4, 4, 1, 2, BOUNDS_WIDE, deadline=t0 - 1)
+    # 已过期时限须立即中止，而不是跑完整轮枚举
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_tight_deadline_raises_during_enumeration():
+    pts, _ = __import__("scripts.smoke", fromlist=["build_case"]).build_case()
+    with pytest.raises(DeadlineExceeded):
+        reconstruct(pts, 4, 4, 1, 2, BOUNDS_WIDE, deadline=time.monotonic() + 0.001)
+
+
+def test_generous_deadline_returns_identical_optimum():
+    # 时限内完成时，结果必须与无时限运行逐字节一致（未经降级）
+    pts, _ = __import__("scripts.smoke", fromlist=["build_case"]).build_case()
+    unlimited = reconstruct(pts, 4, 4, 1, 2, BOUNDS_WIDE)
+    limited = reconstruct(
+        pts, 4, 4, 1, 2, BOUNDS_WIDE, deadline=time.monotonic() + 60
+    )
+    assert limited == unlimited
+
+
+def test_no_deadline_keeps_unsolvable_behavior():
+    pts = [(i, 100 + 3 * i, 200 + 3 * i) for i in range(1, 8)]
+    res = reconstruct(pts, 3, 3, 0, 2, BOUNDS_WIDE, deadline=None)
+    assert res["solvable"] is False
+    assert res["reason"]
 
 
 if __name__ == "__main__":

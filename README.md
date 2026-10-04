@@ -36,6 +36,7 @@ API_PORT=9000 ./verify
 
 1. `pytest` 代码测试；
 2. 复原冒烟（4×4 栅格漏读 4 格 + 2 个划痕亮点 + 坐标抖动，经 HTTP 提交）；
+3. 时限冒烟（`deadline_ms=1` 的受限请求及时返回 504，随后普通请求照常完成）；
 
 并以自身退出码汇报（成功 0）。单独启动服务：`API_PORT=9000 docker compose up web`。
 
@@ -60,6 +61,23 @@ API_PORT=9000 ./verify
 
 约束：7–14 个唯一编号点；行/列 3–7；`max_outliers` 0–2；各区间跨度 ≤ 6。
 
+可选字段 `deadline_ms`（1–5000 毫秒）：单次复原的计算时限。省略时不设限，
+请求、响应与裁决行为与既有版本完全一致。时限内完成裁决时返回的原最优结果
+不做任何降级；到期仍无法完成裁决时返回 HTTP 504：
+
+```json
+{
+  "status": "deadline_exceeded",
+  "deadline_ms": 200,
+  "retryable": true,
+  "detail": "在 200 ms 时限内未能完成全局最优裁决；这不代表几何上无解，可放宽 deadline_ms 后重试。"
+}
+```
+
+504 响应只表示“本次尚未裁决”，不含参数、分配或无解结论；据此可明确区分
+**几何无解**（HTTP 200 + `solvable: false`）与**时限到期**（HTTP 504，
+`retryable: true`），并在不阻塞后续晶圆处理的情况下放宽时限重试。
+
 成功返回（HTTP 200，`solvable: true`）：`parameters`（原点、两基向量、行列式）、
 `objective`（弃点数 / 最大残差 / 残差和）、`assignments`（逐点格位、预测坐标、
 残差）、`discarded`（弃点证据：最近格位、最近残差、容差内候选、弃点原因）。
@@ -75,5 +93,6 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 pytest -q
 python scripts/smoke.py              # 直测求解器
+python scripts/deadline_smoke.py     # 直测时限行为（内存 TestClient）
 BASE_URL=http://127.0.0.1:8000 python scripts/smoke.py   # 走 HTTP
 ```
